@@ -1480,21 +1480,24 @@ static void test_bit_vector_range_iterator_bounds() noexcept {
   }
 
   // Case 2: end mid-word in the last BitWord; mirrors a production state.
-  // 64-word bitmap, search [72, 4083), free bits at 4093-4095. Without the
-  // fix, iterator returns range_start = 4093, range_end clamped to 4083.
+  // Last 3 bits of the bitmap are free, end is placed 13 bits before total
+  // (mid last word). Without the fix, iterator returns range_start at the
+  // tail free bits >= end.
   {
     constexpr size_t kWordCount = 64;
+    constexpr size_t kTotalBits = kWordCount * kBwBits;
+    constexpr size_t kEnd = kTotalBits - 13u;
     Bw bitmap[kWordCount];
     for (size_t i = 0; i < kWordCount; i++) {
       bitmap[i] = all_ones;
     }
     bitmap[kWordCount - 1u] = ~(Bw(0x7) << (kBwBits - 3u));
 
-    BitVectorRangeIterator<Bw, 0> it(bitmap, kWordCount, 72u, 4083u);
+    BitVectorRangeIterator<Bw, 0> it(bitmap, kWordCount, 72u, kEnd);
     size_t s = 0, e = 0;
     while (it.next_range(Out(s), Out(e))) {
-      EXPECT_LT(s, 4083u);
-      EXPECT_LE(e, 4083u);
+      EXPECT_LT(s, kEnd);
+      EXPECT_LE(e, kEnd);
       EXPECT_LE(s, e);
     }
   }
@@ -1523,6 +1526,12 @@ static void test_jit_allocator_search_end_bounds() noexcept {
   uint32_t area_size = block->area_size();
   uint32_t granularity = pool->granularity;
 
+  // Need enough room to place a search range with fragmented free bits inside
+  // and 3 free bits at the tail past _search_end.
+  if (area_size < 256u) {
+    return;
+  }
+
   // Production state: 14 free areas total. 11 are fragmented inside the
   // search range with no contiguous run >= 7 (forces the search to the last
   // BitWord). The other 3 sit at the tail past _search_end - the buggy
@@ -1531,9 +1540,10 @@ static void test_jit_allocator_search_end_bounds() noexcept {
   Support::bit_vector_fill(block->_used_bit_vector, 0u, area_size);
 
   // Fragmented free areas inside the search range, none contiguous >= 7.
-  Support::bit_vector_clear(block->_used_bit_vector, 1232u, 5u);
-  Support::bit_vector_clear(block->_used_bit_vector, 1575u, 1u);
-  Support::bit_vector_clear(block->_used_bit_vector, 2843u, 5u);
+  uint32_t mid = area_size / 2u;
+  Support::bit_vector_clear(block->_used_bit_vector, mid - 64u, 5u);
+  Support::bit_vector_clear(block->_used_bit_vector, mid, 1u);
+  Support::bit_vector_clear(block->_used_bit_vector, mid + 64u, 5u);
   // 3 free areas past _search_end.
   Support::bit_vector_clear(block->_used_bit_vector, area_size - 3u, 3u);
 
