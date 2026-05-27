@@ -108,6 +108,11 @@ public:
     size_t i = Support::ctz(_bit_word);
 
     *range_start = _idx + i;
+    if (ASMJIT_UNLIKELY(*range_start >= _end)) {
+      // `init()` only masks bits before `start`, so the current BitWord can
+      // carry free bits past `_end` and `ctz` would return such a position.
+      return false;
+    }
     _bit_word = ~(_bit_word ^ ~(Support::bit_ones<T> << i));
 
     if (_bit_word == 0) {
@@ -1450,6 +1455,132 @@ static void BitVectorRangeIterator_testRandom(TestUtils::Random& rnd, size_t cou
   }
 }
 
+// Regression test for BitVectorRangeIterator returning ranges past `end`.
+//
+// `init()` only masks bits before `start`, so a BitWord can carry free bits
+// past `end`. Without bounding `range_start` against `end`, `ctz` could pick
+// such a bit, the caller would then compute `range_size = range_end - range_start`
+// as `size_t` (range_end gets clamped to `end`), the subtraction underflows,
+// and a range that lies entirely past the search region would be accepted.
+// Inside JitAllocator that produced an area_index outside the block, an
+// oversized Span, and an eventual write to unmapped memory.
+static void test_bit_vector_range_iterator_bounds() noexcept {
+  using Bw = Support::BitWord;
+  constexpr Bw all_ones = Support::bit_ones<Bw>;
+  constexpr size_t kBwBits = Support::bit_size_of<Bw>;
+
+  // Case 1: start and end share the same BitWord; free bits live past end-in-word.
+  // bitmap = [used: bits 0..(kBwBits/2)-1, free: bits (kBwBits/2)..kBwBits-1]
+  // search range = [8, 16). Without the fix, ctz picks bit kBwBits/2 -> range_start = kBwBits/2 > 16.
+  {
+    Bw bitmap[1];
+    bitmap[0] = (Bw(1) << (kBwBits / 2u)) - Bw(1);
+    BitVectorRangeIterator<Bw, 0> it(bitmap, 1u, 8u, 16u);
+    size_t s = 0, e = 0;
+    while (it.next_range(Out(s), Out(e))) {
+      EXPECT_LT(s, 16u);
+      EXPECT_LE(e, 16u);
+      EXPECT_LE(s, e);
+    }
+  }
+
+  // Case 2: end mid-word in the last BitWord scanned; free bits live past end.
+  // This mirrors a JitAllocator state observed in production: a 64-BitWord
+  // bitmap, search range [72, 4083), and 3 free bits at positions 61-63 of
+  // word 63 (absolute 4093-4095). Without the fix the iterator returned
+  // range_start = 4093, range_end clamped to 4083.
+  {
+    constexpr size_t kWordCount = 64;
+    Bw bitmap[kWordCount];
+    for (size_t i = 0; i < kWordCount; i++) {
+      bitmap[i] = all_ones;
+    }
+    bitmap[kWordCount - 1u] = ~(Bw(0x7) << (kBwBits - 3u));
+
+    BitVectorRangeIterator<Bw, 0> it(bitmap, kWordCount, 72u, 4083u);
+    size_t s = 0, e = 0;
+    while (it.next_range(Out(s), Out(e))) {
+      EXPECT_LT(s, 4083u);
+      EXPECT_LE(e, 4083u);
+      EXPECT_LE(s, e);
+    }
+  }
+}
+
+// Regression test for JitAllocator returning an oversized Span when bitmap
+// search finds a range past the block boundary. Drives the allocator into the
+// exact state captured in a QuestDB production core dump: an almost-full
+// block where the iterator can match the last few free areas at the tail
+// even though the search-region end is set below them.
+//
+// The hand-crafted state cannot be reached purely via the public API in a
+// few calls, so this test directly manipulates the block bookkeeping it has
+// access to. It relies on the block being the cursor block of the default
+// pool, which is true right after the first allocation lands.
+static void test_jit_allocator_search_end_bounds() noexcept {
+  JitAllocator allocator;
+
+  // Force a block to come into existence and capture an allocation we can
+  // build the rest of the state around.
+  JitAllocator::Span anchor_span;
+  EXPECT_EQ(allocator.alloc(Out(anchor_span), 64u), Error::kOk);
+  EXPECT_NOT_NULL(anchor_span.rx());
+
+  JitAllocatorBlock* block = static_cast<JitAllocatorBlock*>(anchor_span._block);
+  EXPECT_NOT_NULL(block);
+
+  JitAllocatorPool* pool = block->pool();
+  uint32_t area_size = block->area_size();
+  uint32_t granularity = pool->granularity;
+
+  // Mirror the production state captured in a QuestDB core dump:
+  //   - area_used = area_size - 14 (14 free total), so area_available >= 7
+  //     and alloc enters the bitmap-search path;
+  //   - 11 of those free areas are fragmented inside [_search_start, _search_end),
+  //     none of them a contiguous run >= 7, so the search runs to the last
+  //     BitWord without taking the fast match;
+  //   - the remaining 3 free areas sit at the very tail (area_size - 3 ..
+  //     area_size - 1), past _search_end. The buggy iterator picks those up
+  //     and the caller treats the underflowed range_size as oversize fit.
+  Support::bit_vector_fill(block->_used_bit_vector, 0u, area_size);
+
+  // Fragmented free areas inside the search range, none contiguous >= 7.
+  Support::bit_vector_clear(block->_used_bit_vector, 1232u, 5u);
+  Support::bit_vector_clear(block->_used_bit_vector, 1575u, 1u);
+  Support::bit_vector_clear(block->_used_bit_vector, 2843u, 5u);
+  // 3 free areas past _search_end.
+  Support::bit_vector_clear(block->_used_bit_vector, area_size - 3u, 3u);
+
+  // Anchor sentinels - one per "live" allocation. The exact placement doesn't
+  // matter for triggering the bug, it just keeps mark_released_area's
+  // bookkeeping reachable when we tear the test down.
+  Support::bit_vector_set_bit(block->_stop_bit_vector, area_size - 4u, true);
+
+  block->_area_used = area_size - 14u;
+  block->_largest_unused_area = 5u;
+  block->_search_start = 72u;
+  block->_search_end = area_size - 13u;
+  block->add_flags(JitAllocatorBlock::kFlagDirty);
+  block->clear_flags(JitAllocatorBlock::kFlagIncremental);
+
+  // Ask for 7 areas. With the bug, alloc accepts area_index = area_size - 3
+  // (start of the free tail past _search_end), reports a Span of 7 areas
+  // worth of memory, and that Span extends 4 areas past the block end. With
+  // the fix, the bitmap search reports no fit and a fresh block is allocated.
+  JitAllocator::Span span;
+  EXPECT_EQ(allocator.alloc(Out(span), size_t(7u) * granularity), Error::kOk);
+  EXPECT_NOT_NULL(span.rx());
+
+  uint8_t* span_rx = static_cast<uint8_t*>(span.rx());
+  uint8_t* span_end = span_rx + span.size();
+  uint8_t* block_end = block->rx_ptr() + block->block_size();
+
+  if (span_rx >= block->rx_ptr() && span_rx < block_end) {
+    EXPECT_LE(span_end, block_end)
+      .message("Span [%p:%p] extends past block end %p", span_rx, span_end, block_end);
+  }
+}
+
 static void test_jit_allocator_reset_empty() noexcept {
   JitAllocator allocator;
   allocator.reset(ResetPolicy::kSoft);
@@ -1635,6 +1766,8 @@ static void test_jit_allocator_query() noexcept {
 }
 
 UNIT(jit_allocator) {
+  test_bit_vector_range_iterator_bounds();
+  test_jit_allocator_search_end_bounds();
   test_jit_allocator_reset_empty();
   test_jit_allocator_alloc_release();
   test_jit_allocator_query();
